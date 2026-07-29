@@ -810,6 +810,20 @@ function ExternalStreamLab() {
   const resourceUrlRef = useRef("");
   const lastStatsRef = useRef({ bytes: 0, timestamp: 0 });
 
+  useEffect(() => {
+    const host = window.location.hostname;
+    const localMediaHost = host === "localhost" ? "127.0.0.1" : host;
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host.startsWith("192.168.") ||
+      host.startsWith("10.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    ) {
+      setEndpoint(`http://${localMediaHost}:8889/rc/whep`);
+    }
+  }, []);
+
   const disconnect = useCallback(() => {
     if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
     statsTimerRef.current = null;
