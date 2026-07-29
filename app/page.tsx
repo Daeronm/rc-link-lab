@@ -9,9 +9,15 @@ type Sample = {
 };
 
 type PeerRole = "transmitter" | "receiver";
+type VideoProfile = "low" | "balanced" | "quality";
 
 const TARGET_MS = 30;
 const SAMPLE_LIMIT = 80;
+const VIDEO_PROFILES = {
+  low: { label: "Latência — 640×360 / 1,5 Mbps", width: 640, height: 360, bitrate: 1_500_000 },
+  balanced: { label: "Equilíbrio — 960×540 / 2,5 Mbps", width: 960, height: 540, bitrate: 2_500_000 },
+  quality: { label: "Qualidade — 1280×720 / 4 Mbps", width: 1280, height: 720, bitrate: 4_000_000 },
+} as const;
 
 function percentile(values: number[], percent: number) {
   if (!values.length) return null;
@@ -82,7 +88,7 @@ function preferH264(pc: RTCPeerConnection, sender: RTCRtpSender) {
   transceiver.setCodecPreferences(codecs);
 }
 
-async function tuneSenderForLowLatency(sender: RTCRtpSender) {
+async function tuneSenderForLowLatency(sender: RTCRtpSender, maxBitrate: number) {
   const track = sender.track;
   if (track && "contentHint" in track) track.contentHint = "motion";
 
@@ -90,7 +96,7 @@ async function tuneSenderForLowLatency(sender: RTCRtpSender) {
     degradationPreference?: "balanced" | "maintain-framerate" | "maintain-resolution";
   };
   parameters.encodings ??= [{}];
-  parameters.encodings[0].maxBitrate = 4_000_000;
+  parameters.encodings[0].maxBitrate = maxBitrate;
   parameters.encodings[0].maxFramerate = 30;
   parameters.encodings[0].scaleResolutionDownBy = 1;
   parameters.encodings[0].priority = "high";
@@ -123,8 +129,11 @@ export default function Home() {
   const [peerLoss, setPeerLoss] = useState<number | null>(null);
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedVideoDevice, setSelectedVideoDevice] = useState("");
+  const [videoProfile, setVideoProfile] = useState<VideoProfile>("low");
   const [cameraSettings, setCameraSettings] = useState("");
   const [localEncodeMs, setLocalEncodeMs] = useState<number | null>(null);
+  const [localSendFps, setLocalSendFps] = useState<number | null>(null);
+  const [remoteSourceFps, setRemoteSourceFps] = useState<number | null>(null);
   const [remoteEncodeMs, setRemoteEncodeMs] = useState<number | null>(null);
   const [receiveProcessingMs, setReceiveProcessingMs] = useState<number | null>(null);
   const sequenceRef = useRef(0);
@@ -138,6 +147,8 @@ export default function Home() {
   const pendingPingsRef = useRef(new Map<string, number>());
   const lastStatsRef = useRef({ bytes: 0, timestamp: 0 });
   const lastPeerProcessingRef = useRef({ total: 0, frames: 0 });
+  const lastOutboundFramesRef = useRef({ frames: 0, timestamp: 0 });
+  const lastLossRef = useRef({ lost: 0, received: 0 });
 
   useEffect(() => {
     setTestUrl(window.location.origin);
@@ -190,10 +201,14 @@ export default function Home() {
     setPeerLoss(null);
     setCameraSettings("");
     setLocalEncodeMs(null);
+    setLocalSendFps(null);
+    setRemoteSourceFps(null);
     setRemoteEncodeMs(null);
     setReceiveProcessingMs(null);
     lastStatsRef.current = { bytes: 0, timestamp: 0 };
     lastPeerProcessingRef.current = { total: 0, frames: 0 };
+    lastOutboundFramesRef.current = { frames: 0, timestamp: 0 };
+    lastLossRef.current = { lost: 0, received: 0 };
   }, []);
 
   useEffect(() => stopPeer, [stopPeer]);
@@ -216,6 +231,7 @@ export default function Home() {
           type: string;
           id?: string;
           encodeMs?: number;
+          fps?: number;
         };
         if (message.type === "ping" && channel.readyState === "open") {
           channel.send(JSON.stringify({ type: "pong", id: message.id }));
@@ -229,6 +245,7 @@ export default function Home() {
         }
         if (message.type === "encoder-stats" && Number.isFinite(message.encodeMs)) {
           setRemoteEncodeMs(message.encodeMs ?? null);
+          if (Number.isFinite(message.fps)) setRemoteSourceFps(message.fps ?? null);
         }
       } catch {
         // Ignora mensagens que não pertencem ao medidor.
@@ -245,11 +262,28 @@ export default function Home() {
         if (report.type === "outbound-rtp" && report.kind === "video") {
           const framesEncoded = Number(report.framesEncoded ?? 0);
           const totalEncodeTime = Number(report.totalEncodeTime ?? 0);
+          const timestamp = Number(report.timestamp ?? performance.now());
+          const previousFrames = lastOutboundFramesRef.current;
+          let sendFps = Number(report.framesPerSecond ?? 0);
+          if (
+            previousFrames.timestamp &&
+            timestamp > previousFrames.timestamp &&
+            framesEncoded >= previousFrames.frames
+          ) {
+            sendFps =
+              (framesEncoded - previousFrames.frames) /
+              ((timestamp - previousFrames.timestamp) / 1000);
+          }
+          lastOutboundFramesRef.current = { frames: framesEncoded, timestamp };
+          if (sendFps > 0) setLocalSendFps(sendFps);
+
           if (framesEncoded > 0 && totalEncodeTime >= 0) {
             const encodeMs = (totalEncodeTime / framesEncoded) * 1000;
             setLocalEncodeMs(encodeMs);
             if (dataChannelRef.current?.readyState === "open") {
-              dataChannelRef.current.send(JSON.stringify({ type: "encoder-stats", encodeMs }));
+              dataChannelRef.current.send(
+                JSON.stringify({ type: "encoder-stats", encodeMs, fps: sendFps }),
+              );
             }
           }
         }
@@ -263,7 +297,14 @@ export default function Home() {
           }
           lastStatsRef.current = { bytes, timestamp };
           setPeerFps(Number(report.framesPerSecond ?? 0));
-          setPeerLoss(Number(report.packetsLost ?? 0));
+          const packetsLost = Number(report.packetsLost ?? 0);
+          const packetsReceived = Number(report.packetsReceived ?? 0);
+          const previousLoss = lastLossRef.current;
+          const lostDelta = Math.max(0, packetsLost - previousLoss.lost);
+          const receivedDelta = Math.max(0, packetsReceived - previousLoss.received);
+          const packetDelta = lostDelta + receivedDelta;
+          if (packetDelta > 0) setPeerLoss((lostDelta / packetDelta) * 100);
+          lastLossRef.current = { lost: packetsLost, received: packetsReceived };
 
           const framesDecoded = Number(report.framesDecoded ?? 0);
           const totalProcessingDelay = Number(report.totalProcessingDelay ?? 0);
@@ -319,6 +360,7 @@ export default function Home() {
   async function startTransmitter(source: "camera" | "screen") {
     try {
       setPeerStatus(source === "camera" ? "Solicitando câmera…" : "Solicitando tela…");
+      const profile = VIDEO_PROFILES[videoProfile];
       const stream =
         source === "camera"
           ? await navigator.mediaDevices.getUserMedia({
@@ -326,8 +368,8 @@ export default function Home() {
                 ...(selectedVideoDevice
                   ? { deviceId: { exact: selectedVideoDevice } }
                   : {}),
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
+                width: { ideal: profile.width },
+                height: { ideal: profile.height },
                 frameRate: { ideal: 30, max: 30 },
               },
               audio: false,
@@ -353,7 +395,7 @@ export default function Home() {
         const sender = pc.addTrack(track, stream);
         if (track.kind === "video") {
           preferH264(pc, sender);
-          await tuneSenderForLowLatency(sender);
+          await tuneSenderForLowLatency(sender, profile.bitrate);
         }
       }
       configureDataChannel(pc.createDataChannel("rc-latency", { ordered: false, maxRetransmits: 0 }));
@@ -770,6 +812,20 @@ export default function Home() {
                       "Depois de permitir o acesso, o navegador exibirá os nomes das câmeras."}
                   </small>
                 </label>
+                <label className="cameraPicker">
+                  <span>Perfil de transmissão</span>
+                  <select
+                    value={videoProfile}
+                    onChange={(event) => setVideoProfile(event.target.value as VideoProfile)}
+                  >
+                    {Object.entries(VIDEO_PROFILES).map(([value, profile]) => (
+                      <option key={value} value={value}>
+                        {profile.label}
+                      </option>
+                    ))}
+                  </select>
+                  <small>Comece por Latência para verificar se o enlace sustenta 30 fps.</small>
+                </label>
                 <div className="sourceButtons">
                   <button className="primaryButton" onClick={() => startTransmitter("camera")}>
                     Usar câmera
@@ -842,8 +898,17 @@ export default function Home() {
             )}
           />
           <Metric label="Bitrate recebido" value={peerBitrate === null ? "—" : `${peerBitrate.toFixed(1)} Mbps`} />
+          <Metric
+            label="FPS enviado"
+            value={
+              (peerRole === "transmitter" ? localSendFps : remoteSourceFps)?.toFixed(0) ?? "—"
+            }
+          />
           <Metric label="FPS recebido" value={peerFps === null ? "—" : peerFps.toFixed(0)} />
-          <Metric label="Pacotes perdidos" value={peerLoss === null ? "—" : peerLoss.toFixed(0)} />
+          <Metric
+            label="Perda no último segundo"
+            value={peerLoss === null ? "—" : `${peerLoss.toFixed(2)}%`}
+          />
         </div>
 
         <p className="finePrint">
