@@ -54,6 +54,55 @@ function waitForIce(pc: RTCPeerConnection) {
   });
 }
 
+function tuneReceiverForLowLatency(receiver: RTCRtpReceiver) {
+  const adjustableReceiver = receiver as RTCRtpReceiver & {
+    jitterBufferTarget?: number | null;
+  };
+  if ("jitterBufferTarget" in adjustableReceiver) {
+    try {
+      adjustableReceiver.jitterBufferTarget = 0;
+    } catch {
+      // O navegador escolhe o menor buffer quando a API não está disponível.
+    }
+  }
+}
+
+function preferH264(pc: RTCPeerConnection, sender: RTCRtpSender) {
+  const transceiver = pc.getTransceivers().find((item) => item.sender === sender);
+  const capabilities = RTCRtpReceiver.getCapabilities("video");
+  if (!transceiver?.setCodecPreferences || !capabilities) return;
+
+  const codecs = [...capabilities.codecs].sort((left, right) => {
+    const score = (codec: (typeof capabilities.codecs)[number]) => {
+      if (codec.mimeType.toLowerCase() !== "video/h264") return 0;
+      return codec.sdpFmtpLine?.includes("packetization-mode=1") ? 2 : 1;
+    };
+    return score(right) - score(left);
+  });
+  transceiver.setCodecPreferences(codecs);
+}
+
+async function tuneSenderForLowLatency(sender: RTCRtpSender) {
+  const track = sender.track;
+  if (track && "contentHint" in track) track.contentHint = "motion";
+
+  const parameters = sender.getParameters() as RTCRtpSendParameters & {
+    degradationPreference?: "balanced" | "maintain-framerate" | "maintain-resolution";
+  };
+  parameters.encodings ??= [{}];
+  parameters.encodings[0].maxBitrate = 4_000_000;
+  parameters.encodings[0].maxFramerate = 30;
+  parameters.encodings[0].scaleResolutionDownBy = 1;
+  parameters.encodings[0].priority = "high";
+  parameters.degradationPreference = "maintain-framerate";
+
+  try {
+    await sender.setParameters(parameters);
+  } catch {
+    // Safari e versões antigas aplicam apenas parte destes parâmetros.
+  }
+}
+
 export default function Home() {
   const [samples, setSamples] = useState<Sample[]>([]);
   const [running, setRunning] = useState(false);
@@ -88,6 +137,7 @@ export default function Home() {
   const statsTimerRef = useRef<number | null>(null);
   const pendingPingsRef = useRef(new Map<string, number>());
   const lastStatsRef = useRef({ bytes: 0, timestamp: 0 });
+  const lastPeerProcessingRef = useRef({ total: 0, frames: 0 });
 
   useEffect(() => {
     setTestUrl(window.location.origin);
@@ -142,6 +192,8 @@ export default function Home() {
     setLocalEncodeMs(null);
     setRemoteEncodeMs(null);
     setReceiveProcessingMs(null);
+    lastStatsRef.current = { bytes: 0, timestamp: 0 };
+    lastPeerProcessingRef.current = { total: 0, frames: 0 };
   }, []);
 
   useEffect(() => stopPeer, [stopPeer]);
@@ -215,8 +267,11 @@ export default function Home() {
 
           const framesDecoded = Number(report.framesDecoded ?? 0);
           const totalProcessingDelay = Number(report.totalProcessingDelay ?? 0);
-          if (framesDecoded > 0 && totalProcessingDelay > 0) {
-            setReceiveProcessingMs((totalProcessingDelay / framesDecoded) * 1000);
+          const previousProcessing = lastPeerProcessingRef.current;
+          const frameDelta = framesDecoded - previousProcessing.frames;
+          const processingDelta = totalProcessingDelay - previousProcessing.total;
+          if (frameDelta > 0 && processingDelta >= 0) {
+            setReceiveProcessingMs((processingDelta / frameDelta) * 1000);
           } else {
             const emitted = Number(report.jitterBufferEmittedCount ?? 0);
             const jitterDelay = Number(report.jitterBufferDelay ?? 0);
@@ -227,6 +282,7 @@ export default function Home() {
               setReceiveProcessingMs(decodeMs + jitterMs);
             }
           }
+          lastPeerProcessingRef.current = { total: totalProcessingDelay, frames: framesDecoded };
         }
       });
     }, 1000);
@@ -252,6 +308,7 @@ export default function Home() {
       setPeerStatus(labels[pc.connectionState]);
     };
     pc.ontrack = (event) => {
+      tuneReceiverForLowLatency(event.receiver);
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
     };
     pc.ondatachannel = (event) => configureDataChannel(event.channel);
@@ -271,12 +328,12 @@ export default function Home() {
                   : {}),
                 width: { ideal: 1280 },
                 height: { ideal: 720 },
-                frameRate: { ideal: 60, max: 60 },
+                frameRate: { ideal: 30, max: 30 },
               },
               audio: false,
             })
           : await navigator.mediaDevices.getDisplayMedia({
-              video: { frameRate: { ideal: 60, max: 60 } },
+              video: { frameRate: { ideal: 30, max: 30 } },
               audio: false,
             });
       const pc = createPeer();
@@ -292,7 +349,13 @@ export default function Home() {
         await refreshVideoDevices();
       }
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      for (const track of stream.getTracks()) {
+        const sender = pc.addTrack(track, stream);
+        if (track.kind === "video") {
+          preferH264(pc, sender);
+          await tuneSenderForLowLatency(sender);
+        }
+      }
       configureDataChannel(pc.createDataChannel("rc-latency", { ordered: false, maxRetransmits: 0 }));
       await pc.setLocalDescription(await pc.createOffer());
       await waitForIce(pc);
@@ -809,6 +872,7 @@ function ExternalStreamLab() {
   const statsTimerRef = useRef<number | null>(null);
   const resourceUrlRef = useRef("");
   const lastStatsRef = useRef({ bytes: 0, timestamp: 0 });
+  const lastProcessingRef = useRef({ total: 0, frames: 0 });
 
   useEffect(() => {
     const host = window.location.hostname;
@@ -839,6 +903,8 @@ function ExternalStreamLab() {
     setFps(null);
     setLoss(null);
     setProcessing(null);
+    lastStatsRef.current = { bytes: 0, timestamp: 0 };
+    lastProcessingRef.current = { total: 0, frames: 0 };
     setStatus("Desconectado");
   }, []);
 
@@ -870,9 +936,13 @@ function ExternalStreamLab() {
 
         const framesDecoded = Number(report.framesDecoded ?? 0);
         const totalProcessingDelay = Number(report.totalProcessingDelay ?? 0);
-        if (framesDecoded > 0 && totalProcessingDelay > 0) {
-          setProcessing((totalProcessingDelay / framesDecoded) * 1000);
+        const previousProcessing = lastProcessingRef.current;
+        const frameDelta = framesDecoded - previousProcessing.frames;
+        const processingDelta = totalProcessingDelay - previousProcessing.total;
+        if (frameDelta > 0 && processingDelta >= 0) {
+          setProcessing((processingDelta / frameDelta) * 1000);
         }
+        lastProcessingRef.current = { total: totalProcessingDelay, frames: framesDecoded };
       });
 
       const selectedPair = selectedPairId ? reports.get(selectedPairId) : null;
@@ -902,6 +972,7 @@ function ExternalStreamLab() {
       peerRef.current = pc;
       pc.addTransceiver("video", { direction: "recvonly" });
       pc.ontrack = (event) => {
+        tuneReceiverForLowLatency(event.receiver);
         if (videoRef.current) videoRef.current.srcObject = event.streams[0];
       };
       pc.onconnectionstatechange = () => {
