@@ -56,12 +56,13 @@ function waitForIce(pc: RTCPeerConnection) {
 
 export default function Home() {
   const [samples, setSamples] = useState<Sample[]>([]);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(400);
   const [burstSize, setBurstSize] = useState(2);
   const [burstResult, setBurstResult] = useState<number | null>(null);
   const [burstRunning, setBurstRunning] = useState(false);
   const [testUrl, setTestUrl] = useState("");
+  const [isLocal, setIsLocal] = useState(true);
   const [peerRole, setPeerRole] = useState<PeerRole>("transmitter");
   const [pairingOut, setPairingOut] = useState("");
   const [pairingIn, setPairingIn] = useState("");
@@ -84,6 +85,14 @@ export default function Home() {
 
   useEffect(() => {
     setTestUrl(window.location.origin);
+    const host = window.location.hostname;
+    setIsLocal(
+      host === "localhost" ||
+        host === "127.0.0.1" ||
+        host.startsWith("192.168.") ||
+        host.startsWith("10.") ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host),
+    );
   }, []);
 
   const stopPeer = useCallback(() => {
@@ -374,8 +383,9 @@ export default function Home() {
           <p className="eyebrow">META DO PROTÓTIPO · RTT &lt; {TARGET_MS} MS</p>
           <h1>Quanto tempo o sinal leva para voltar?</h1>
           <p className="heroText">
-            Abra esta página em outro dispositivo conectado ao mesmo roteador. Cada pulso
-            sai dele, chega ao computador servidor e volta com uma medição real.
+            {isLocal
+              ? "Abra esta página em outro dispositivo conectado ao mesmo roteador. Cada pulso sai dele, chega ao computador servidor e volta com uma medição real."
+              : "Neste endereço online, os pulsos medem o caminho até a nuvem. Para medir diretamente entre computador e receptor, use o laboratório WebRTC abaixo."}
           </p>
         </div>
         <div className={`speedGauge ${status.tone}`}>
@@ -508,20 +518,35 @@ export default function Home() {
       <section className="setupPanel">
         <div>
           <span className="sectionTag">COMO USAR</span>
-          <h2>Servidor neste computador. Teste em outro dispositivo.</h2>
+          <h2>
+            {isLocal
+              ? "Servidor neste computador. Teste em outro dispositivo."
+              : "Teste de internet aqui. Teste ponto a ponto logo abaixo."}
+          </h2>
         </div>
         <ol>
-          <li><span>01</span>Conecte computador e dispositivo à mesma rede local.</li>
-          <li><span>02</span>Abra o endereço abaixo no celular, notebook ou Raspberry Pi.</li>
-          <li><span>03</span>Caminhe pelo ambiente e exporte cada rodada para comparar.</li>
+          {isLocal ? (
+            <>
+              <li><span>01</span>Conecte computador e dispositivo à mesma rede local.</li>
+              <li><span>02</span>Abra o endereço abaixo no celular, notebook ou Raspberry Pi.</li>
+              <li><span>03</span>Caminhe pelo ambiente e exporte cada rodada para comparar.</li>
+            </>
+          ) : (
+            <>
+              <li><span>01</span>Clique em iniciar para medir dispositivo→nuvem→dispositivo.</li>
+              <li><span>02</span>Abra este mesmo endereço no computador e no aparelho receptor.</li>
+              <li><span>03</span>Use câmera/tela e o pareamento WebRTC para medir entre os dois.</li>
+            </>
+          )}
         </ol>
         <div className="addressBox">
           <code>{testUrl || "carregando endereço…"}</code>
           <button onClick={copyAddress}>Copiar</button>
         </div>
         <p className="finePrint">
-          Esta tela mede RTT HTTP da aplicação, não ping ICMP e ainda não mede câmera→tela.
-          Ela serve para validar a rede antes de inserir o vídeo.
+          {isLocal
+            ? "Esta tela mede RTT HTTP da aplicação, não ping ICMP e ainda não mede câmera→tela. Ela serve para validar a rede antes de inserir o vídeo."
+            : "O RTT acima termina no servidor online. O RTT WebRTC abaixo é a medição ponto a ponto entre transmissor e receptor."}
         </p>
       </section>
 
