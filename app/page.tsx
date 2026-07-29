@@ -72,6 +72,12 @@ export default function Home() {
   const [peerBitrate, setPeerBitrate] = useState<number | null>(null);
   const [peerFps, setPeerFps] = useState<number | null>(null);
   const [peerLoss, setPeerLoss] = useState<number | null>(null);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedVideoDevice, setSelectedVideoDevice] = useState("");
+  const [cameraSettings, setCameraSettings] = useState("");
+  const [localEncodeMs, setLocalEncodeMs] = useState<number | null>(null);
+  const [remoteEncodeMs, setRemoteEncodeMs] = useState<number | null>(null);
+  const [receiveProcessingMs, setReceiveProcessingMs] = useState<number | null>(null);
   const sequenceRef = useRef(0);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -95,6 +101,25 @@ export default function Home() {
     );
   }, []);
 
+  const refreshVideoDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(
+      (device) => device.kind === "videoinput",
+    );
+    setVideoDevices(devices);
+    setSelectedVideoDevice((current) =>
+      current && devices.some((device) => device.deviceId === current)
+        ? current
+        : (devices[0]?.deviceId ?? ""),
+    );
+  }, []);
+
+  useEffect(() => {
+    void refreshVideoDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", refreshVideoDevices);
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshVideoDevices);
+  }, [refreshVideoDevices]);
+
   const stopPeer = useCallback(() => {
     if (peerPingTimerRef.current) window.clearInterval(peerPingTimerRef.current);
     if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
@@ -113,6 +138,10 @@ export default function Home() {
     setPeerBitrate(null);
     setPeerFps(null);
     setPeerLoss(null);
+    setCameraSettings("");
+    setLocalEncodeMs(null);
+    setRemoteEncodeMs(null);
+    setReceiveProcessingMs(null);
   }, []);
 
   useEffect(() => stopPeer, [stopPeer]);
@@ -131,16 +160,23 @@ export default function Home() {
     };
     channel.onmessage = (event) => {
       try {
-        const message = JSON.parse(String(event.data)) as { type: string; id: string };
+        const message = JSON.parse(String(event.data)) as {
+          type: string;
+          id?: string;
+          encodeMs?: number;
+        };
         if (message.type === "ping" && channel.readyState === "open") {
           channel.send(JSON.stringify({ type: "pong", id: message.id }));
         }
-        if (message.type === "pong") {
+        if (message.type === "pong" && message.id) {
           const started = pendingPingsRef.current.get(message.id);
           if (started !== undefined) {
             setPeerRtt(performance.now() - started);
             pendingPingsRef.current.delete(message.id);
           }
+        }
+        if (message.type === "encoder-stats" && Number.isFinite(message.encodeMs)) {
+          setRemoteEncodeMs(message.encodeMs ?? null);
         }
       } catch {
         // Ignora mensagens que não pertencem ao medidor.
@@ -154,17 +190,44 @@ export default function Home() {
     statsTimerRef.current = window.setInterval(async () => {
       const reports = await pc.getStats();
       reports.forEach((report) => {
-        if (report.type !== "inbound-rtp" || report.kind !== "video") return;
-        const bytes = Number(report.bytesReceived ?? 0);
-        const timestamp = Number(report.timestamp ?? performance.now());
-        const previous = lastStatsRef.current;
-        if (previous.timestamp && timestamp > previous.timestamp) {
-          const bitrate = ((bytes - previous.bytes) * 8) / ((timestamp - previous.timestamp) / 1000);
-          setPeerBitrate(Math.max(0, bitrate / 1_000_000));
+        if (report.type === "outbound-rtp" && report.kind === "video") {
+          const framesEncoded = Number(report.framesEncoded ?? 0);
+          const totalEncodeTime = Number(report.totalEncodeTime ?? 0);
+          if (framesEncoded > 0 && totalEncodeTime >= 0) {
+            const encodeMs = (totalEncodeTime / framesEncoded) * 1000;
+            setLocalEncodeMs(encodeMs);
+            if (dataChannelRef.current?.readyState === "open") {
+              dataChannelRef.current.send(JSON.stringify({ type: "encoder-stats", encodeMs }));
+            }
+          }
         }
-        lastStatsRef.current = { bytes, timestamp };
-        setPeerFps(Number(report.framesPerSecond ?? 0));
-        setPeerLoss(Number(report.packetsLost ?? 0));
+        if (report.type === "inbound-rtp" && report.kind === "video") {
+          const bytes = Number(report.bytesReceived ?? 0);
+          const timestamp = Number(report.timestamp ?? performance.now());
+          const previous = lastStatsRef.current;
+          if (previous.timestamp && timestamp > previous.timestamp) {
+            const bitrate = ((bytes - previous.bytes) * 8) / ((timestamp - previous.timestamp) / 1000);
+            setPeerBitrate(Math.max(0, bitrate / 1_000_000));
+          }
+          lastStatsRef.current = { bytes, timestamp };
+          setPeerFps(Number(report.framesPerSecond ?? 0));
+          setPeerLoss(Number(report.packetsLost ?? 0));
+
+          const framesDecoded = Number(report.framesDecoded ?? 0);
+          const totalProcessingDelay = Number(report.totalProcessingDelay ?? 0);
+          if (framesDecoded > 0 && totalProcessingDelay > 0) {
+            setReceiveProcessingMs((totalProcessingDelay / framesDecoded) * 1000);
+          } else {
+            const emitted = Number(report.jitterBufferEmittedCount ?? 0);
+            const jitterDelay = Number(report.jitterBufferDelay ?? 0);
+            const decodeTime = Number(report.totalDecodeTime ?? 0);
+            if (framesDecoded > 0) {
+              const decodeMs = (decodeTime / framesDecoded) * 1000;
+              const jitterMs = emitted > 0 ? (jitterDelay / emitted) * 1000 : 0;
+              setReceiveProcessingMs(decodeMs + jitterMs);
+            }
+          }
+        }
       });
     }, 1000);
   }
@@ -203,6 +266,9 @@ export default function Home() {
         source === "camera"
           ? await navigator.mediaDevices.getUserMedia({
               video: {
+                ...(selectedVideoDevice
+                  ? { deviceId: { exact: selectedVideoDevice } }
+                  : {}),
                 width: { ideal: 1280 },
                 height: { ideal: 720 },
                 frameRate: { ideal: 60, max: 60 },
@@ -215,6 +281,16 @@ export default function Home() {
             });
       const pc = createPeer();
       localStreamRef.current = stream;
+      if (source === "camera") {
+        const settings = stream.getVideoTracks()[0]?.getSettings();
+        setCameraSettings(
+          `${settings?.width ?? "?"}×${settings?.height ?? "?"} @ ${
+            settings?.frameRate ? settings.frameRate.toFixed(0) : "?"
+          } FPS`,
+        );
+        if (settings?.deviceId) setSelectedVideoDevice(settings.deviceId);
+        await refreshVideoDevices();
+      }
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       configureDataChannel(pc.createDataChannel("rc-latency", { ordered: false, maxRetransmits: 0 }));
@@ -227,6 +303,11 @@ export default function Home() {
       setPeerStatus("Falha ao iniciar");
     }
   }
+
+  const estimatedFrameMs =
+    remoteEncodeMs !== null && peerRtt !== null && receiveProcessingMs !== null
+      ? remoteEncodeMs + peerRtt / 2 + receiveProcessingMs
+      : null;
 
   async function generateReceiverAnswer() {
     try {
@@ -603,6 +684,27 @@ export default function Home() {
           <div className="peerControls">
             {peerRole === "transmitter" ? (
               <>
+                <label className="cameraPicker">
+                  <span>Câmera de vídeo</span>
+                  <select
+                    value={selectedVideoDevice}
+                    onChange={(event) => setSelectedVideoDevice(event.target.value)}
+                  >
+                    {videoDevices.length === 0 ? (
+                      <option value="">Câmera padrão do navegador</option>
+                    ) : (
+                      videoDevices.map((device, index) => (
+                        <option key={device.deviceId} value={device.deviceId}>
+                          {device.label || `Câmera ${index + 1}`}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <small>
+                    {cameraSettings ||
+                      "Depois de permitir o acesso, o navegador exibirá os nomes das câmeras."}
+                  </small>
+                </label>
                 <div className="sourceButtons">
                   <button className="primaryButton" onClick={() => startTransmitter("camera")}>
                     Usar câmera
@@ -658,6 +760,22 @@ export default function Home() {
 
         <div className="peerMetrics">
           <Metric label="RTT WebRTC" value={formatMs(peerRtt)} accent={peerRtt !== null && peerRtt <= 30} />
+          <Metric
+            label="Estimativa do frame"
+            value={formatMs(estimatedFrameMs)}
+            accent={estimatedFrameMs !== null && estimatedFrameMs <= 80}
+            hint={
+              peerRole === "transmitter"
+                ? "Aparece no receptor"
+                : "Encoder + ½ RTT + recepção"
+            }
+          />
+          <Metric
+            label={peerRole === "transmitter" ? "Tempo do encoder" : "Processamento receptor"}
+            value={formatMs(
+              peerRole === "transmitter" ? localEncodeMs : receiveProcessingMs,
+            )}
+          />
           <Metric label="Bitrate recebido" value={peerBitrate === null ? "—" : `${peerBitrate.toFixed(1)} Mbps`} />
           <Metric label="FPS recebido" value={peerFps === null ? "—" : peerFps.toFixed(0)} />
           <Metric label="Pacotes perdidos" value={peerLoss === null ? "—" : peerLoss.toFixed(0)} />
@@ -666,7 +784,9 @@ export default function Home() {
         <p className="finePrint">
           O pareamento é manual nesta versão: copie o convite, gere a resposta no receptor e
           devolva-a ao transmissor. O vídeo viaja diretamente entre os aparelhos; a hospedagem
-          não retransmite a mídia.
+          não retransmite a mídia. A estimativa de frame usa tempo médio de codificação + metade
+          do RTT + processamento médio no receptor; não inclui exposição do sensor nem atraso
+          físico da tela.
         </p>
       </section>
     </main>

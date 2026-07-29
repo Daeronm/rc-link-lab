@@ -644,6 +644,38 @@ h2 {
   gap: 9px;
 }
 
+.cameraPicker {
+  display: grid;
+  gap: 7px;
+}
+
+.cameraPicker > span {
+  color: #aeb7c6;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.cameraPicker select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid #384354;
+  border-radius: 10px;
+  outline: none;
+  color: #dfe6ef;
+  background: #080c12;
+}
+
+.cameraPicker select:focus {
+  border-color: var(--acid);
+}
+
+.cameraPicker small {
+  color: #808b9c;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .peerLab .primaryButton {
   border-color: var(--acid);
   color: #101500;
@@ -710,7 +742,7 @@ h2 {
 
 .peerMetrics {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 9px;
   margin-top: 18px;
 }
