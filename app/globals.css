@@ -655,7 +655,8 @@ h2 {
   font-weight: 700;
 }
 
-.cameraPicker select {
+.cameraPicker select,
+.cameraPicker input {
   width: 100%;
   min-height: 42px;
   padding: 0 11px;
@@ -666,8 +667,21 @@ h2 {
   background: #080c12;
 }
 
-.cameraPicker select:focus {
+.cameraPicker select:focus,
+.cameraPicker input:focus {
   border-color: var(--acid);
+}
+
+.cameraPicker input {
+  font: 11px/1.4 var(--font-geist-mono);
+}
+
+.externalStreamLab {
+  margin-top: 16px;
+}
+
+.externalGrid {
+  margin-top: 24px;
 }
 
 .cameraPicker small {

@@ -631,6 +631,8 @@ export default function Home() {
         </p>
       </section>
 
+      <ExternalStreamLab />
+
       <section className="peerLab">
         <div className="peerIntro">
           <div>
@@ -790,6 +792,190 @@ export default function Home() {
         </p>
       </section>
     </main>
+  );
+}
+
+function ExternalStreamLab() {
+  const [endpoint, setEndpoint] = useState("http://127.0.0.1:8889/rc/whep");
+  const [status, setStatus] = useState("Aguardando conexão");
+  const [error, setError] = useState("");
+  const [rtt, setRtt] = useState<number | null>(null);
+  const [bitrate, setBitrate] = useState<number | null>(null);
+  const [fps, setFps] = useState<number | null>(null);
+  const [loss, setLoss] = useState<number | null>(null);
+  const [processing, setProcessing] = useState<number | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const peerRef = useRef<RTCPeerConnection | null>(null);
+  const statsTimerRef = useRef<number | null>(null);
+  const resourceUrlRef = useRef("");
+  const lastStatsRef = useRef({ bytes: 0, timestamp: 0 });
+
+  const disconnect = useCallback(() => {
+    if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
+    statsTimerRef.current = null;
+    peerRef.current?.close();
+    peerRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    if (resourceUrlRef.current) {
+      void fetch(resourceUrlRef.current, { method: "DELETE" }).catch(() => undefined);
+      resourceUrlRef.current = "";
+    }
+    setRtt(null);
+    setBitrate(null);
+    setFps(null);
+    setLoss(null);
+    setProcessing(null);
+    setStatus("Desconectado");
+  }, []);
+
+  useEffect(() => disconnect, [disconnect]);
+
+  function startStats(pc: RTCPeerConnection) {
+    if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
+    statsTimerRef.current = window.setInterval(async () => {
+      const reports = await pc.getStats();
+      let selectedPairId = "";
+
+      reports.forEach((report) => {
+        if (report.type === "transport" && report.selectedCandidatePairId) {
+          selectedPairId = String(report.selectedCandidatePairId);
+        }
+        if (report.type !== "inbound-rtp" || report.kind !== "video") return;
+
+        const bytes = Number(report.bytesReceived ?? 0);
+        const timestamp = Number(report.timestamp ?? performance.now());
+        const previous = lastStatsRef.current;
+        if (previous.timestamp && timestamp > previous.timestamp) {
+          const bitsPerSecond =
+            ((bytes - previous.bytes) * 8) / ((timestamp - previous.timestamp) / 1000);
+          setBitrate(Math.max(0, bitsPerSecond / 1_000_000));
+        }
+        lastStatsRef.current = { bytes, timestamp };
+        setFps(Number(report.framesPerSecond ?? 0));
+        setLoss(Number(report.packetsLost ?? 0));
+
+        const framesDecoded = Number(report.framesDecoded ?? 0);
+        const totalProcessingDelay = Number(report.totalProcessingDelay ?? 0);
+        if (framesDecoded > 0 && totalProcessingDelay > 0) {
+          setProcessing((totalProcessingDelay / framesDecoded) * 1000);
+        }
+      });
+
+      const selectedPair = selectedPairId ? reports.get(selectedPairId) : null;
+      if (selectedPair?.currentRoundTripTime !== undefined) {
+        setRtt(Number(selectedPair.currentRoundTripTime) * 1000);
+      } else {
+        reports.forEach((report) => {
+          if (
+            report.type === "candidate-pair" &&
+            report.state === "succeeded" &&
+            report.nominated &&
+            report.currentRoundTripTime !== undefined
+          ) {
+            setRtt(Number(report.currentRoundTripTime) * 1000);
+          }
+        });
+      }
+    }, 1000);
+  }
+
+  async function connect() {
+    try {
+      disconnect();
+      setError("");
+      setStatus("Negociando WHEP…");
+      const pc = new RTCPeerConnection();
+      peerRef.current = pc;
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.ontrack = (event) => {
+        if (videoRef.current) videoRef.current.srcObject = event.streams[0];
+      };
+      pc.onconnectionstatechange = () => {
+        const labels: Partial<Record<RTCPeerConnectionState, string>> = {
+          new: "Criado",
+          connecting: "Conectando…",
+          connected: "Vídeo conectado",
+          disconnected: "Sinal interrompido",
+          failed: "Falha WebRTC",
+          closed: "Encerrado",
+        };
+        setStatus(labels[pc.connectionState] ?? pc.connectionState);
+      };
+
+      await pc.setLocalDescription(await pc.createOffer());
+      await waitForIce(pc);
+      const response = await fetch(endpoint.trim(), {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: pc.localDescription?.sdp,
+      });
+      if (!response.ok) {
+        throw new Error(`MediaMTX respondeu HTTP ${response.status}`);
+      }
+      const location = response.headers.get("Location");
+      if (location) resourceUrlRef.current = new URL(location, endpoint).toString();
+      await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
+      startStats(pc);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível abrir o fluxo");
+      setStatus("Falha ao conectar");
+    }
+  }
+
+  return (
+    <section className="peerLab externalStreamLab">
+      <div className="peerIntro">
+        <div>
+          <span className="sectionTag">CÂMERA EXTERNA / RC</span>
+          <h2>Receba o fluxo do transmissor</h2>
+        </div>
+        <p>
+          A câmera é capturada fora do site. Esta página apenas recebe o sinal WHEP e mede a
+          conexão WebRTC com o servidor de mídia.
+        </p>
+      </div>
+
+      <div className="peerGrid externalGrid">
+        <div className="videoStage">
+          <video ref={videoRef} autoPlay muted playsInline />
+          <div className="videoPlaceholder">
+            <strong>SINAL DO RC</strong>
+            <span>{status}</span>
+          </div>
+        </div>
+
+        <div className="peerControls">
+          <label className="cameraPicker">
+            <span>Endpoint WHEP</span>
+            <input
+              value={endpoint}
+              onChange={(event) => setEndpoint(event.target.value)}
+              spellCheck={false}
+            />
+            <small>Teste local padrão: http://127.0.0.1:8889/rc/whep</small>
+          </label>
+          <button className="primaryButton" onClick={connect}>
+            Conectar ao vídeo
+          </button>
+          <button className="secondaryButton" onClick={disconnect}>
+            Desconectar
+          </button>
+          {error && <p className="peerError">{error}</p>}
+          <p className="finePrint">
+            Em uma implantação externa, substitua o endereço local pelo domínio HTTPS do servidor
+            MediaMTX.
+          </p>
+        </div>
+      </div>
+
+      <div className="peerMetrics">
+        <Metric label="RTT até o servidor" value={formatMs(rtt)} accent={rtt !== null && rtt <= 30} />
+        <Metric label="Processamento receptor" value={formatMs(processing)} />
+        <Metric label="Bitrate recebido" value={bitrate === null ? "—" : `${bitrate.toFixed(1)} Mbps`} />
+        <Metric label="FPS recebido" value={fps === null ? "—" : fps.toFixed(0)} />
+        <Metric label="Pacotes perdidos" value={loss === null ? "—" : loss.toFixed(0)} />
+      </div>
+    </section>
   );
 }
 
