@@ -580,6 +580,61 @@ h2 {
   background: var(--acid);
 }
 
+.turnPanel {
+  margin: 0 0 18px;
+  padding: 14px 16px;
+  border: 1px solid #303947;
+  border-radius: 14px;
+  background: rgba(20, 27, 38, 0.78);
+}
+
+.turnPanel summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  cursor: pointer;
+  color: #dfe6ef;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.turnPanel summary strong {
+  color: var(--acid);
+  font: 700 11px/1 var(--font-geist-mono);
+}
+
+.turnPanel > p {
+  margin: 14px 0;
+  color: #aeb7c6;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.turnFields {
+  display: grid;
+  grid-template-columns: 1.6fr 0.7fr 0.7fr;
+  gap: 10px;
+}
+
+.relayToggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 13px 0 8px;
+  color: #dfe6ef;
+  font-size: 11px;
+}
+
+.relayToggle input {
+  accent-color: var(--acid);
+}
+
+.turnPanel > small {
+  color: #808b9c;
+  font-size: 10px;
+}
+
 .peerGrid {
   display: grid;
   grid-template-columns: 1.2fr 0.8fr;
@@ -754,6 +809,34 @@ h2 {
   font-size: 12px;
 }
 
+.iceDiagnostics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 9px;
+  margin-top: 18px;
+}
+
+.iceDiagnostics > div {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  padding: 13px 14px;
+  border: 1px solid #303947;
+  border-radius: 12px;
+  background: rgba(20, 27, 38, 0.72);
+}
+
+.iceDiagnostics span {
+  color: #808b9c;
+  font-size: 10px;
+}
+
+.iceDiagnostics strong {
+  overflow-wrap: anywhere;
+  color: #dfe6ef;
+  font: 650 11px/1.4 var(--font-geist-mono);
+}
+
 .peerMetrics {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -813,6 +896,18 @@ h2 {
   }
 
   .peerMetrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .turnFields {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .turnUrlField {
+    grid-column: span 2;
+  }
+
+  .iceDiagnostics {
     grid-template-columns: repeat(2, 1fr);
   }
 }
@@ -886,5 +981,14 @@ h2 {
 
   .sourceButtons {
     grid-template-columns: 1fr;
+  }
+
+  .turnFields,
+  .iceDiagnostics {
+    grid-template-columns: 1fr;
+  }
+
+  .turnUrlField {
+    grid-column: auto;
   }
 }

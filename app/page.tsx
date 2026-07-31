@@ -10,6 +10,7 @@ type Sample = {
 
 type PeerRole = "transmitter" | "receiver";
 type VideoProfile = "low" | "balanced" | "quality";
+type CandidateCounts = { host: number; srflx: number; relay: number; other: number };
 
 const TARGET_MS = 30;
 const SAMPLE_LIMIT = 80;
@@ -56,8 +57,32 @@ function waitForIce(pc: RTCPeerConnection) {
     window.setTimeout(() => {
       pc.removeEventListener("icegatheringstatechange", listener);
       resolve();
-    }, 5000);
+    }, 12000);
   });
+}
+
+function emptyCandidateCounts(): CandidateCounts {
+  return { host: 0, srflx: 0, relay: 0, other: 0 };
+}
+
+function candidateCountsFromSdp(sdp = ""): CandidateCounts {
+  const counts = emptyCandidateCounts();
+  for (const line of sdp.split(/\r?\n/)) {
+    if (!line.startsWith("a=candidate:")) continue;
+    const match = line.match(/\styp\s(host|srflx|relay|prflx)(?:\s|$)/);
+    if (match?.[1] === "host") counts.host += 1;
+    else if (match?.[1] === "srflx") counts.srflx += 1;
+    else if (match?.[1] === "relay") counts.relay += 1;
+    else counts.other += 1;
+  }
+  return counts;
+}
+
+function parseTurnUrls(value: string) {
+  return value
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function tuneReceiverForLowLatency(receiver: RTCRtpReceiver) {
@@ -123,6 +148,14 @@ export default function Home() {
   const [pairingIn, setPairingIn] = useState("");
   const [peerStatus, setPeerStatus] = useState("Pronto para iniciar");
   const [peerError, setPeerError] = useState("");
+  const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState>("new");
+  const [iceGatheringState, setIceGatheringState] = useState<RTCIceGatheringState>("new");
+  const [signalingState, setSignalingState] = useState<RTCSignalingState>("stable");
+  const [connectionRoute, setConnectionRoute] = useState("Ainda não selecionada");
+  const [turnUrl, setTurnUrl] = useState("");
+  const [turnUsername, setTurnUsername] = useState("");
+  const [turnCredential, setTurnCredential] = useState("");
+  const [forceRelay, setForceRelay] = useState(false);
   const [peerRtt, setPeerRtt] = useState<number | null>(null);
   const [peerBitrate, setPeerBitrate] = useState<number | null>(null);
   const [peerFps, setPeerFps] = useState<number | null>(null);
@@ -205,11 +238,27 @@ export default function Home() {
     setRemoteSourceFps(null);
     setRemoteEncodeMs(null);
     setReceiveProcessingMs(null);
+    setIceConnectionState("new");
+    setIceGatheringState("new");
+    setSignalingState("stable");
+    setConnectionRoute("Ainda não selecionada");
     lastStatsRef.current = { bytes: 0, timestamp: 0 };
     lastPeerProcessingRef.current = { total: 0, frames: 0 };
     lastOutboundFramesRef.current = { frames: 0, timestamp: 0 };
     lastLossRef.current = { lost: 0, received: 0 };
   }, []);
+
+  const localCandidates = useMemo(
+    () => candidateCountsFromSdp(pairingOut ? parseDescription(pairingOut).sdp : ""),
+    [pairingOut],
+  );
+  const remoteCandidates = useMemo(() => {
+    try {
+      return candidateCountsFromSdp(pairingIn ? parseDescription(pairingIn).sdp : "");
+    } catch {
+      return emptyCandidateCounts();
+    }
+  }, [pairingIn]);
 
   useEffect(() => stopPeer, [stopPeer]);
 
@@ -326,6 +375,30 @@ export default function Home() {
           lastPeerProcessingRef.current = { total: totalProcessingDelay, frames: framesDecoded };
         }
       });
+
+      reports.forEach((report) => {
+        if (
+          report.type !== "candidate-pair" ||
+          report.state !== "succeeded" ||
+          (!report.nominated && !report.selected)
+        ) {
+          return;
+        }
+        const local = reports.get(report.localCandidateId);
+        const remote = reports.get(report.remoteCandidateId);
+        const localType = String(local?.candidateType ?? "desconhecido");
+        const remoteType = String(remote?.candidateType ?? "desconhecido");
+        const protocol = String(local?.protocol ?? remote?.protocol ?? "").toUpperCase();
+        const viaRelay = localType === "relay" || remoteType === "relay";
+        const viaInternet = [localType, remoteType].some((type) =>
+          ["srflx", "prflx"].includes(type),
+        );
+        setConnectionRoute(
+          `${viaRelay ? "TURN (relay)" : viaInternet ? "Direta pela internet" : "Rede local"}${
+            protocol ? ` • ${protocol}` : ""
+          }`,
+        );
+      });
     }, 1000);
   }
 
@@ -333,10 +406,37 @@ export default function Home() {
     stopPeer();
     setPeerError("");
     setPairingOut("");
+    const turnUrls = parseTurnUrls(turnUrl);
+    const iceServers: RTCIceServer[] = [
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] },
+    ];
+    if (turnUrls.length) {
+      iceServers.push({
+        urls: turnUrls,
+        ...(turnUsername ? { username: turnUsername } : {}),
+        ...(turnCredential ? { credential: turnCredential } : {}),
+      });
+    }
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      iceServers,
+      iceTransportPolicy: forceRelay ? "relay" : "all",
     });
     peerRef.current = pc;
+    setIceConnectionState(pc.iceConnectionState);
+    setIceGatheringState(pc.iceGatheringState);
+    setSignalingState(pc.signalingState);
+    pc.oniceconnectionstatechange = () => {
+      setIceConnectionState(pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed") {
+        setPeerError(
+          turnUrls.length
+            ? "ICE falhou mesmo com TURN. Confira URL, usuário e senha nos dois aparelhos."
+            : "ICE falhou: não houve rota direta. Configure um TURN externo nos dois aparelhos.",
+        );
+      }
+    };
+    pc.onicegatheringstatechange = () => setIceGatheringState(pc.iceGatheringState);
+    pc.onsignalingstatechange = () => setSignalingState(pc.signalingState);
     pc.onconnectionstatechange = () => {
       const labels: Record<RTCPeerConnectionState, string> = {
         new: "Criado",
@@ -359,6 +459,9 @@ export default function Home() {
 
   async function startTransmitter(source: "camera" | "screen") {
     try {
+      if (forceRelay && !parseTurnUrls(turnUrl).length) {
+        throw new Error("Para forçar TURN, informe primeiro o endereço do servidor externo.");
+      }
       setPeerStatus(source === "camera" ? "Solicitando câmera…" : "Solicitando tela…");
       const profile = VIDEO_PROFILES[videoProfile];
       const stream =
@@ -401,7 +504,13 @@ export default function Home() {
       configureDataChannel(pc.createDataChannel("rc-latency", { ordered: false, maxRetransmits: 0 }));
       await pc.setLocalDescription(await pc.createOffer());
       await waitForIce(pc);
-      setPairingOut(JSON.stringify(pc.localDescription));
+      const description = pc.localDescription;
+      if (!description) throw new Error("O navegador não conseguiu gerar o convite.");
+      const candidates = candidateCountsFromSdp(description.sdp);
+      if (parseTurnUrls(turnUrl).length && candidates.relay === 0) {
+        setPeerError("TURN configurado, mas nenhum candidato relay foi obtido. Confira as credenciais.");
+      }
+      setPairingOut(JSON.stringify(description));
       setPeerStatus("Convite gerado — envie ao receptor");
     } catch (error) {
       setPeerError(error instanceof Error ? error.message : "Não foi possível iniciar a mídia");
@@ -416,11 +525,23 @@ export default function Home() {
 
   async function generateReceiverAnswer() {
     try {
+      if (pairingOut) throw new Error("A resposta já foi gerada. Copie-a e devolva ao transmissor.");
+      if (forceRelay && !parseTurnUrls(turnUrl).length) {
+        throw new Error("Para forçar TURN, informe primeiro o endereço do servidor externo.");
+      }
+      const offer = parseDescription(pairingIn);
+      if (offer.type !== "offer") throw new Error("O receptor precisa receber um convite do tipo offer.");
       const pc = createPeer();
-      await pc.setRemoteDescription(parseDescription(pairingIn));
+      await pc.setRemoteDescription(offer);
       await pc.setLocalDescription(await pc.createAnswer());
       await waitForIce(pc);
-      setPairingOut(JSON.stringify(pc.localDescription));
+      const description = pc.localDescription;
+      if (!description) throw new Error("O navegador não conseguiu gerar a resposta.");
+      const candidates = candidateCountsFromSdp(description.sdp);
+      if (parseTurnUrls(turnUrl).length && candidates.relay === 0) {
+        setPeerError("TURN configurado, mas nenhum candidato relay foi obtido. Confira as credenciais.");
+      }
+      setPairingOut(JSON.stringify(description));
       setPeerStatus("Resposta gerada — devolva ao transmissor");
     } catch (error) {
       setPeerError(error instanceof Error ? error.message : "Não foi possível gerar a resposta");
@@ -430,7 +551,12 @@ export default function Home() {
   async function applyTransmitterAnswer() {
     try {
       if (!peerRef.current) throw new Error("Gere primeiro um convite no transmissor");
-      await peerRef.current.setRemoteDescription(parseDescription(pairingIn));
+      if (peerRef.current.signalingState !== "have-local-offer") {
+        throw new Error("Esta resposta já foi aplicada ou o convite foi reiniciado. Gere uma tentativa nova.");
+      }
+      const answer = parseDescription(pairingIn);
+      if (answer.type !== "answer") throw new Error("O transmissor precisa receber uma resposta do tipo answer.");
+      await peerRef.current.setRemoteDescription(answer);
       setPeerStatus("Resposta aplicada — conectando…");
       setPeerError("");
     } catch (error) {
@@ -775,6 +901,58 @@ export default function Home() {
           </button>
         </div>
 
+        <details className="turnPanel">
+          <summary>
+            <span>TURN externo</span>
+            <strong>{turnUrl ? "Configurado" : "Não configurado"}</strong>
+          </summary>
+          <p>
+            Use as mesmas credenciais nos dois aparelhos. O TURN fica na internet e não exige
+            abrir nenhuma porta no seu modem.
+          </p>
+          <div className="turnFields">
+            <label className="cameraPicker turnUrlField">
+              <span>Endereços TURN, separados por vírgula</span>
+              <input
+                value={turnUrl}
+                onChange={(event) => setTurnUrl(event.target.value)}
+                placeholder="turn:servidor:3478?transport=udp, turns:servidor:443"
+                autoComplete="off"
+              />
+            </label>
+            <label className="cameraPicker">
+              <span>Usuário</span>
+              <input
+                value={turnUsername}
+                onChange={(event) => setTurnUsername(event.target.value)}
+                placeholder="Usuário TURN"
+                autoComplete="off"
+              />
+            </label>
+            <label className="cameraPicker">
+              <span>Senha</span>
+              <input
+                type="password"
+                value={turnCredential}
+                onChange={(event) => setTurnCredential(event.target.value)}
+                placeholder="Senha TURN"
+                autoComplete="off"
+              />
+            </label>
+          </div>
+          <label className="relayToggle">
+            <input
+              type="checkbox"
+              checked={forceRelay}
+              onChange={(event) => setForceRelay(event.target.checked)}
+            />
+            <span>Forçar relay para testar o TURN</span>
+          </label>
+          <small>
+            As credenciais ficam somente nesta aba. Para uso real, utilize credenciais temporárias.
+          </small>
+        </details>
+
         <div className="peerGrid">
           <div className="videoStage">
             {peerRole === "transmitter" ? (
@@ -848,7 +1026,7 @@ export default function Home() {
                 <button
                   className="primaryButton"
                   onClick={applyTransmitterAnswer}
-                  disabled={!pairingIn}
+                  disabled={!pairingIn || signalingState !== "have-local-offer"}
                 >
                   Aplicar resposta e conectar
                 </button>
@@ -863,7 +1041,7 @@ export default function Home() {
                 <button
                   className="primaryButton"
                   onClick={generateReceiverAnswer}
-                  disabled={!pairingIn}
+                  disabled={!pairingIn || Boolean(pairingOut)}
                 >
                   Gerar resposta
                 </button>
@@ -876,6 +1054,37 @@ export default function Home() {
               </>
             )}
             {peerError && <p className="peerError">{peerError}</p>}
+          </div>
+        </div>
+
+        <div className="iceDiagnostics" aria-label="Diagnóstico da conexão WebRTC">
+          <div>
+            <span>Estado ICE</span>
+            <strong>{iceConnectionState}</strong>
+          </div>
+          <div>
+            <span>Coleta ICE</span>
+            <strong>{iceGatheringState}</strong>
+          </div>
+          <div>
+            <span>Sinalização</span>
+            <strong>{signalingState}</strong>
+          </div>
+          <div>
+            <span>Rota selecionada</span>
+            <strong>{connectionRoute}</strong>
+          </div>
+          <div>
+            <span>Candidatos deste aparelho</span>
+            <strong>
+              host {localCandidates.host} • internet {localCandidates.srflx} • relay {localCandidates.relay}
+            </strong>
+          </div>
+          <div>
+            <span>Candidatos do outro aparelho</span>
+            <strong>
+              host {remoteCandidates.host} • internet {remoteCandidates.srflx} • relay {remoteCandidates.relay}
+            </strong>
           </div>
         </div>
 
